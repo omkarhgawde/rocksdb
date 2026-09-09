@@ -7,6 +7,8 @@
 
 #include <atomic>
 #include <cinttypes>
+#include <cstring>
+#include <memory>
 
 #include "db/db_test_util.h"
 #include "db/dbformat.h"
@@ -1078,6 +1080,45 @@ class SstFileReaderTimestampTest : public testing::Test {
     ASSERT_OK(iter->status());
   }
 
+  // Writes a file holding a single timestamped range tombstone. Each key gets
+  // its own exactly sized heap buffer so that reading past one is caught, and
+  // `timestamp` is placed right after whichever key `timestamp_follows_end_key`
+  // selects -- a lone timestamp can only ever be adjacent to one of the two.
+  void CreateFileWithDeleteRange(const std::string& begin_key,
+                                 const std::string& end_key,
+                                 const std::string& timestamp,
+                                 bool timestamp_follows_end_key,
+                                 ExternalSstFileInfo* file_info) {
+    const std::string& adjacent_key =
+        timestamp_follows_end_key ? end_key : begin_key;
+    const std::string& lone_key =
+        timestamp_follows_end_key ? begin_key : end_key;
+
+    std::unique_ptr<char[]> adjacent_buf(
+        new char[adjacent_key.size() + timestamp.size()]);
+    memcpy(adjacent_buf.get(), adjacent_key.data(), adjacent_key.size());
+    memcpy(adjacent_buf.get() + adjacent_key.size(), timestamp.data(),
+           timestamp.size());
+    std::unique_ptr<char[]> lone_buf(new char[lone_key.size()]);
+    memcpy(lone_buf.get(), lone_key.data(), lone_key.size());
+
+    const Slice adjacent_slice(adjacent_buf.get(), adjacent_key.size());
+    const Slice lone_slice(lone_buf.get(), lone_key.size());
+    const Slice timestamp_slice(adjacent_buf.get() + adjacent_key.size(),
+                                timestamp.size());
+
+    SstFileWriter writer(soptions_, options_);
+    ASSERT_OK(writer.Open(sst_name_));
+    if (timestamp_follows_end_key) {
+      ASSERT_OK(
+          writer.DeleteRange(lone_slice, adjacent_slice, timestamp_slice));
+    } else {
+      ASSERT_OK(
+          writer.DeleteRange(adjacent_slice, lone_slice, timestamp_slice));
+    }
+    ASSERT_OK(writer.Finish(file_info));
+  }
+
  protected:
   std::shared_ptr<Env> env_guard_;
   Options options_;
@@ -1153,6 +1194,31 @@ TEST_F(SstFileReaderTimestampTest, Basic) {
     }
 
     CheckFile(EncodeAsUint64(ts), output_descs);
+  }
+}
+
+TEST_F(SstFileReaderTimestampTest, DeleteRangeTimestampAdjacentToOneKey) {
+  const std::string timestamp = EncodeAsUint64(1);
+
+  {
+    // Only begin_key is followed in memory by the timestamp.
+    ExternalSstFileInfo file_info;
+    CreateFileWithDeleteRange("begin", "end", timestamp,
+                              /* timestamp_follows_end_key */ false,
+                              &file_info);
+    ASSERT_EQ(file_info.smallest_range_del_key, "begin" + timestamp);
+    ASSERT_EQ(file_info.largest_range_del_key, "end" + timestamp);
+  }
+
+  {
+    // Only end_key is followed in memory by the timestamp, and the two keys
+    // are the same length, so testing end_key's adjacency with begin_key's
+    // size would match here.
+    ExternalSstFileInfo file_info;
+    CreateFileWithDeleteRange("aaa", "bbb", timestamp,
+                              /* timestamp_follows_end_key */ true, &file_info);
+    ASSERT_EQ(file_info.smallest_range_del_key, "aaa" + timestamp);
+    ASSERT_EQ(file_info.largest_range_del_key, "bbb" + timestamp);
   }
 }
 
