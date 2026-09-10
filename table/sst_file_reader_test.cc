@@ -27,6 +27,7 @@
 #include "table/format.h"
 #include "table/internal_iterator.h"
 #include "table/meta_blocks.h"
+#include "table/multiget_context.h"
 #include "table/sst_file_writer_collectors.h"
 #include "table/table_reader.h"
 #include "test_util/sync_point.h"
@@ -220,6 +221,65 @@ TEST_F(SstFileReaderTest, Basic) {
     keys.emplace_back(EncodeAsString(i));
   }
   CreateFileAndCheck(keys);
+}
+
+TEST_F(SstFileReaderTest, MultiGetExceedingMaxBatchSize) {
+  // A MultiGetContext holds at most MAX_BATCH_SIZE keys, so a larger request
+  // has to be split into batches. Query the keys in descending order and mix
+  // in absent ones so that results have to survive the sort back into the
+  // caller's order.
+  const size_t num_keys = MultiGetContext::MAX_BATCH_SIZE * 2 + 5;
+
+  SstFileWriter writer(soptions_, options_);
+  ASSERT_OK(writer.Open(sst_name_));
+  for (size_t i = 0; i < num_keys; ++i) {
+    ASSERT_OK(writer.Put(EncodeAsString(i), "val" + std::to_string(i)));
+  }
+  ASSERT_OK(writer.Finish());
+
+  SstFileReader reader(options_);
+  ASSERT_OK(reader.Open(sst_name_));
+
+  std::vector<std::string> key_storage;
+  std::vector<std::string> expected_values;
+  std::vector<bool> expected_found;
+  for (size_t i = num_keys; i > 0; --i) {
+    key_storage.emplace_back(EncodeAsString(i - 1));
+    expected_values.emplace_back("val" + std::to_string(i - 1));
+    expected_found.push_back(true);
+
+    key_storage.emplace_back("absent" + std::to_string(i - 1));
+    // A key that is not in the file leaves its output slot untouched.
+    expected_values.emplace_back("");
+    expected_found.push_back(false);
+  }
+  std::vector<Slice> keys(key_storage.begin(), key_storage.end());
+
+  auto found_flags = [](const std::vector<Status>& statuses) {
+    std::vector<bool> found;
+    found.reserve(statuses.size());
+    for (const Status& s : statuses) {
+      EXPECT_TRUE(s.ok() || s.IsNotFound()) << s.ToString();
+      found.push_back(s.ok());
+    }
+    return found;
+  };
+
+  std::vector<std::string> values;
+  std::vector<Status> statuses = reader.MultiGet(ReadOptions(), keys, &values);
+  EXPECT_EQ(found_flags(statuses), expected_found);
+  EXPECT_EQ(values, expected_values);
+
+  std::vector<PinnableSlice> pinnable_values;
+  std::vector<Status> pinnable_statuses =
+      reader.MultiGet(ReadOptions(), keys, &pinnable_values);
+  std::vector<std::string> pinnable_as_strings;
+  pinnable_as_strings.reserve(pinnable_values.size());
+  for (const PinnableSlice& value : pinnable_values) {
+    pinnable_as_strings.emplace_back(value.data(), value.size());
+  }
+  EXPECT_EQ(found_flags(pinnable_statuses), expected_found);
+  EXPECT_EQ(pinnable_as_strings, expected_values);
 }
 
 TEST_F(SstFileReaderTest, EmbeddedBlobRoundTrip) {
